@@ -73,6 +73,13 @@ export const App: React.FC = () => {
   useEffect(() => {
     refreshAll();
     NotificationService.syncAllCordovaReminders(repository.getReminders());
+
+    const unsubscribe = NotificationService.onDeviceReady(() => {
+      console.log('App: Cordova device is ready! Resyncing all reminders to Android AlarmManager...');
+      NotificationService.syncAllCordovaReminders(repository.getReminders());
+    });
+
+    return () => unsubscribe();
   }, [refreshAll]);
 
   // Periodic reminder checking interval (every 15s) for in-app and browser notifications

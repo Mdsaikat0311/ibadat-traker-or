@@ -1,7 +1,7 @@
 import { ReminderSetting } from '../types/ibadat';
 import { getRandomQuote } from '../data/hadithBank';
 
-// Cordova plugin typing
+// Cordova plugin typing definitions
 declare global {
   interface Window {
     cordova?: {
@@ -14,20 +14,36 @@ declare global {
             cancel: (id: any | any[], callback?: () => void) => void;
             clear: (id: any | any[], callback?: () => void) => void;
             getAll: (callback: (notifications: any[]) => void) => void;
+            on?: (event: string, callback: (...args: any[]) => void) => void;
           };
+        };
+        backgroundMode?: {
+          enable: () => void;
+          disable: () => void;
+          isEnabled: () => boolean;
+          isActive: () => boolean;
+          setDefaults: (options: Record<string, any>) => void;
+          overrideBackButton: () => void;
+        };
+        permissions?: {
+          POST_NOTIFICATIONS?: string;
+          checkPermission: (permission: string, success: (status: any) => void, error?: (err: any) => void) => void;
+          requestPermission: (permission: string, success: (status: any) => void, error?: (err: any) => void) => void;
         };
       };
     };
   }
 }
 
-// Memory of what was triggered today to prevent duplicate triggers
+// Memory of what was triggered today to prevent duplicate triggers in JS ticker
 const triggeredKeysToday = new Set<string>();
 let lastDayKey = "";
 let lastHadithTimestamp = Date.now();
 let lastGeneralTimestamp = Date.now();
+let isDeviceReady = false;
+const readyListeners: Array<() => void> = [];
 
-// Convert activity key to a unique integer ID for Cordova Local Notifications
+// Convert activity key and repeat index to a unique integer ID for Cordova Local Notifications
 function hashKeyToNumber(key: string, index: number): number {
   let hash = 0;
   const str = `${key}_${index}`;
@@ -35,10 +51,40 @@ function hashKeyToNumber(key: string, index: number): number {
     hash = (hash << 5) - hash + str.charCodeAt(i);
     hash |= 0;
   }
-  return Math.abs(hash % 1000000) + index * 10000;
+  return Math.abs(hash % 500000) * 10 + (index % 10) + 1000;
+}
+
+// Initialize Cordova deviceready listener
+if (typeof document !== 'undefined') {
+  document.addEventListener('deviceready', () => {
+    isDeviceReady = true;
+    console.log('[Cordova] deviceready event triggered successfully!');
+    NotificationService.initCordova();
+    readyListeners.forEach((fn) => {
+      try {
+        fn();
+      } catch (e) {
+        console.warn('deviceready listener error:', e);
+      }
+    });
+  }, false);
 }
 
 export class NotificationService {
+  /**
+   * Register a listener for when Cordova deviceready fires
+   */
+  static onDeviceReady(listener: () => void): () => void {
+    if (isDeviceReady) {
+      listener();
+    }
+    readyListeners.push(listener);
+    return () => {
+      const idx = readyListeners.indexOf(listener);
+      if (idx !== -1) readyListeners.splice(idx, 1);
+    };
+  }
+
   /**
    * Check if Cordova Local Notification plugin is available
    */
@@ -50,10 +96,71 @@ export class NotificationService {
   }
 
   /**
-   * Check if Web Notification API is available
+   * Check if Cordova is in environment
+   */
+  static isCordovaEnvironment(): boolean {
+    return Boolean(typeof window !== 'undefined' && window.cordova);
+  }
+
+  /**
+   * Check if Web Notification API is available in browser
    */
   static isWebNotificationAvailable(): boolean {
     return typeof window !== 'undefined' && 'Notification' in window;
+  }
+
+  /**
+   * Initializes Cordova plugins (Background Mode, Channels, Permissions)
+   */
+  static initCordova(): void {
+    if (typeof window === 'undefined' || !window.cordova) return;
+
+    // 1. Configure Background Mode if installed
+    try {
+      const bg = window.cordova.plugins?.backgroundMode;
+      if (bg) {
+        bg.setDefaults({
+          title: 'ইবাদত ট্র্যাকার চলছে',
+          text: 'ওয়াক্ত ও আমলের রিমাইন্ডার ব্যাকগ্রাউন্ডে সক্রিয় রয়েছে',
+          icon: 'icon',
+          color: '0D9488',
+          silent: true
+        });
+        bg.enable();
+        bg.overrideBackButton();
+        console.log('[Cordova] background-mode enabled successfully');
+      }
+    } catch (e) {
+      console.warn('[Cordova] background-mode init failed:', e);
+    }
+
+    // 2. Request Android 13+ Notification Permissions (POST_NOTIFICATIONS)
+    try {
+      const local = window.cordova.plugins?.notification?.local;
+      if (local) {
+        local.hasPermission((granted) => {
+          if (!granted) {
+            local.requestPermission((res) => {
+              console.log('[Cordova] local-notification permission response:', res);
+            });
+          }
+        });
+      }
+
+      const permissions = window.cordova.plugins?.permissions;
+      if (permissions && typeof permissions.POST_NOTIFICATIONS === 'string') {
+        const postNotif = permissions.POST_NOTIFICATIONS;
+        permissions.checkPermission(postNotif, (status: any) => {
+          if (!status?.hasPermission) {
+            permissions.requestPermission(postNotif, (s: any) => {
+              console.log('[Cordova] POST_NOTIFICATIONS granted:', s);
+            });
+          }
+        });
+      }
+    } catch (e) {
+      console.warn('[Cordova] permission check error:', e);
+    }
   }
 
   /**
@@ -62,9 +169,13 @@ export class NotificationService {
   static async requestPermission(): Promise<boolean> {
     if (this.isCordovaAvailable()) {
       return new Promise<boolean>((resolve) => {
-        window.cordova!.plugins!.notification!.local!.requestPermission((granted) => {
-          resolve(Boolean(granted));
-        });
+        try {
+          window.cordova!.plugins!.notification!.local!.requestPermission((granted) => {
+            resolve(Boolean(granted));
+          });
+        } catch {
+          resolve(false);
+        }
       });
     }
 
@@ -85,12 +196,31 @@ export class NotificationService {
    */
   static getPermissionState(): 'granted' | 'denied' | 'default' | 'unsupported' {
     if (this.isCordovaAvailable()) {
-      return 'granted'; // cordova will request when scheduled
+      return 'granted';
     }
     if (this.isWebNotificationAvailable()) {
       return Notification.permission;
     }
     return 'unsupported';
+  }
+
+  /**
+   * Diagnostic report for troubleshooting outside/background notifications
+   */
+  static getDiagnostics(): {
+    isCordova: boolean;
+    isDeviceReady: boolean;
+    hasLocalNotification: boolean;
+    hasBackgroundMode: boolean;
+    permission: string;
+  } {
+    return {
+      isCordova: Boolean(typeof window !== 'undefined' && window.cordova),
+      isDeviceReady,
+      hasLocalNotification: Boolean(typeof window !== 'undefined' && window.cordova?.plugins?.notification?.local),
+      hasBackgroundMode: Boolean(typeof window !== 'undefined' && window.cordova?.plugins?.backgroundMode),
+      permission: this.getPermissionState()
+    };
   }
 
   /**
@@ -132,16 +262,23 @@ export class NotificationService {
     // 1. Play audio chime
     this.playChime();
 
-    // 2. Try Cordova Local Notification
+    // 2. Try Cordova Local Notification (shows on system tray / heads-up)
     if (this.isCordovaAvailable()) {
       try {
         window.cordova!.plugins!.notification!.local!.schedule({
-          id: Math.floor(Math.random() * 900000) + 100000,
+          id: Math.floor(Math.random() * 800000) + 100000,
           title,
           text: body,
           foreground: true,
+          wakeup: true,
           vibrate: true,
-          sound: true
+          sound: true,
+          priority: 2,
+          importance: 4,
+          channel: 'ibadat_instant_channel',
+          channelName: 'ইবাদত রিমাইন্ডার',
+          channelDescription: 'আমল ও ওয়াক্ত নোটিফিকেশন',
+          lockscreenVisibility: 1
         });
       } catch (err) {
         console.warn("Cordova immediate notification failed", err);
@@ -153,8 +290,8 @@ export class NotificationService {
       try {
         new Notification(title, {
           body,
-          icon: '/app-icon.jpg',
-          badge: '/app-icon.jpg',
+          icon: './app-icon.jpg',
+          badge: './app-icon.jpg',
           tag: 'ibadat-reminder'
         });
       } catch (err) {
@@ -164,10 +301,15 @@ export class NotificationService {
   }
 
   /**
-   * Schedule native Cordova local notifications for an activity reminder
+   * Schedule native Cordova local notifications for an activity reminder.
+   * This is registered directly in Android's AlarmManager so that it triggers
+   * even when the user is OUTSIDE the app, locked, or after reboot!
    */
   static scheduleCordovaReminders(setting: ReminderSetting): void {
-    if (!this.isCordovaAvailable()) return;
+    if (!this.isCordovaAvailable()) {
+      console.log(`[Cordova] Cannot schedule ${setting.name}: Cordova plugin not detected.`);
+      return;
+    }
 
     try {
       const [hourStr, minuteStr] = setting.start.split(':');
@@ -187,24 +329,82 @@ export class NotificationService {
           triggerTime.setDate(triggerTime.getDate() + 1);
         }
 
+        const notifId = hashKeyToNumber(setting.key, i);
+
         notifications.push({
-          id: hashKeyToNumber(setting.key, i),
-          title: `ইবাদত রিমাইন্ডার: ${setting.name}`,
-          text: `${setting.name}-এর ওয়াক্ত/আমলের সময় হয়েছে (${i + 1}/${setting.count} বার)। ইবাদত সম্পন্ন করুন।`,
+          id: notifId,
+          title: `⏰ ${setting.name} এর রিমাইন্ডার`,
+          text: `এখন ${setting.name}-এর ওয়াক্ত/আমল করার সময় হয়েছে (${i + 1}/${setting.count} বার)। আমলটি সম্পূর্ণ করুন।`,
           trigger: {
             at: triggerTime,
-            every: 'day' // repeats daily at this time in Cordova!
+            every: 'day' // Android repeats daily at this exact time!
           },
           foreground: true,
+          wakeup: true,
           vibrate: true,
-          sound: true
+          sound: true,
+          priority: 2, // High priority
+          importance: 4, // Android 8+ IMPORTANCE_HIGH (pops up banner)
+          channel: 'ibadat_reminders_channel',
+          channelName: 'ইবাদত ওয়াক্ত রিমাইন্ডার',
+          channelDescription: 'ওয়াক্ত ও আমলের সময়সূচীর নোটিফিকেশন',
+          lockscreenVisibility: 1
         });
       }
 
       window.cordova!.plugins!.notification!.local!.schedule(notifications);
+      console.log(`[Cordova] Successfully scheduled ${notifications.length} alarms for ${setting.name}`);
     } catch (e) {
       console.warn("Failed scheduling Cordova notifications", e);
     }
+  }
+
+  /**
+   * Test a delayed notification (e.g. 5 seconds) so user can minimize
+   * the app and test outside-the-app notification on their phone.
+   */
+  static scheduleDelayedOutsideTest(delaySeconds = 5, onScheduled?: () => void): void {
+    const triggerDate = new Date(Date.now() + delaySeconds * 1000);
+    const title = '🔔 ইবাদত ট্র্যাকার টেস্ট নোটিফিকেশন';
+    const text = 'আলহামদুলিল্লাহ! বাহিরের (Background & Lockscreen) নোটিফিকেশন সফলভাবে কাজ করছে।';
+
+    if (this.isCordovaAvailable()) {
+      try {
+        window.cordova!.plugins!.notification!.local!.schedule({
+          id: 999991,
+          title,
+          text,
+          trigger: { at: triggerDate },
+          foreground: true,
+          wakeup: true,
+          vibrate: true,
+          sound: true,
+          priority: 2,
+          importance: 4,
+          channel: 'ibadat_test_channel',
+          channelName: 'ইবাদত টেস্ট চ্যানেল',
+          channelDescription: 'টেস্টিং নোটিফিকেশন',
+          lockscreenVisibility: 1
+        });
+      } catch (err) {
+        console.warn("Cordova delayed test failed", err);
+      }
+    } else if (this.isWebNotificationAvailable() && Notification.permission === 'granted') {
+      setTimeout(() => {
+        new Notification(title, {
+          body: text,
+          icon: './app-icon.jpg',
+          badge: './app-icon.jpg'
+        });
+        this.playChime();
+      }, delaySeconds * 1000);
+    } else {
+      setTimeout(() => {
+        this.playChime();
+      }, delaySeconds * 1000);
+    }
+
+    if (onScheduled) onScheduled();
   }
 
   /**
@@ -219,13 +419,14 @@ export class NotificationService {
         ids.push(hashKeyToNumber(key, i));
       }
       window.cordova!.plugins!.notification!.local!.cancel(ids);
+      console.log(`[Cordova] Cancelled alarms for ${key}`);
     } catch (e) {
       console.warn("Failed canceling Cordova notifications", e);
     }
   }
 
   /**
-   * Reschedule all active reminders into Cordova (e.g. on app launch)
+   * Reschedule all active reminders into Cordova (e.g. on app launch or deviceready)
    */
   static syncAllCordovaReminders(reminders: Record<string, ReminderSetting>): void {
     if (!this.isCordovaAvailable()) return;
@@ -235,8 +436,8 @@ export class NotificationService {
   }
 
   /**
-   * Periodic scheduler that runs inside the app (every 15-30 seconds)
-   * Checks for prayer/routine reminders, Auto Hadith, and General Reminders.
+   * Periodic scheduler that runs inside the app (every 15-30 seconds).
+   * Note: Only triggers in-app alert when app is foreground, and also sends sound/notification.
    */
   static checkTick(
     reminders: Record<string, ReminderSetting>,
